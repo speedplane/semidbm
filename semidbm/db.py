@@ -18,6 +18,8 @@ from semidbm import compat
 
 _open = compat.file_open
 
+SEEK_SET = 0
+SEEK_END = 2
 
 class _SemiDBM(object):
     """
@@ -26,6 +28,8 @@ class _SemiDBM(object):
         does not exist it will be created.
 
     """
+    open_flags = compat.DATA_OPEN_FLAGS
+
     def __init__(self, dbdir, renamer, data_loader=None,
                  verify_checksums=False):
         self._renamer = renamer
@@ -36,7 +40,6 @@ class _SemiDBM(object):
         self._index = None
         self._data_fd = None
         self._verify_checksums = verify_checksums
-        self._current_offset = 0
         self._load_db()
 
     def _create_db_dir(self):
@@ -46,8 +49,7 @@ class _SemiDBM(object):
     def _load_db(self):
         self._create_db_dir()
         self._index = self._load_index(self._data_filename)
-        self._data_fd = os.open(self._data_filename, compat.DATA_OPEN_FLAGS)
-        self._current_offset = os.lseek(self._data_fd, 0, os.SEEK_END)
+        self._data_fd = _open(self._data_filename, self.open_flags)
 
     def _load_index(self, filename):
         # This method is only used upon instantiation to populate
@@ -85,25 +87,22 @@ class _SemiDBM(object):
                     index[key_name] = (offset, size)
         return index
 
-    def __getitem__(self, key, read=os.read, lseek=os.lseek,
-                    seek_set=os.SEEK_SET, str_type=compat.str_type,
-                    isinstance=isinstance):
+    def __getitem__(self, key, str_type = compat.str_type, 
+            isinstance = isinstance):
         if isinstance(key, str_type):
             key = key.encode('utf-8')
         offset, size = self._index[key]
-        lseek(self._data_fd, offset, seek_set)
-        if not self._verify_checksums:
-            return read(self._data_fd, size)
-        else:
+        self._data_fd.seek(offset, SEEK_SET)
+        value = self._data_fd.read(size)
+        if self._verify_checksums:
             # Checksum is at the end of the value.
-            data = read(self._data_fd, size + 4)
-            return self._verify_checksum_data(key, data)
+            return self._verify_checksum_data(key, value, self._data_fd.read(4))
+        return value
 
-    def _verify_checksum_data(self, key, data):
+    def _verify_checksum_data(self, key, value, chk):
         # key is the bytes of the key,
         # data is the bytes of the value + 4 byte checksum at the end.
-        value = data[:-4]
-        expected = struct.unpack('!I', data[-4:])[0]
+        expected = struct.unpack('!I', chk)[0]
         actual = crc32(key)
         actual = crc32(value, actual)
         if actual & 0xffffffff != expected:
@@ -111,7 +110,7 @@ class _SemiDBM(object):
                 "Corrupt data detected: invalid checksum for key %s" % key)
         return value
 
-    def __setitem__(self, key, value, len=len, crc32=crc32, write=os.write,
+    def __setitem__(self, key, value, len=len, crc32=crc32, 
                     str_type=compat.str_type, pack=struct.pack,
                     isinstance=isinstance):
         if isinstance(key, str_type):
@@ -119,6 +118,7 @@ class _SemiDBM(object):
         if isinstance(value, str_type):
             value = value.encode('utf-8')
         # Write the new data out at the end of the file.
+        self._data_fd.seek(0, SEEK_END)
         # Format is
         # 4 bytes   4bytes              4bytes
         # <keysize><valsize><key><val><keyvalcksum>
@@ -130,16 +130,15 @@ class _SemiDBM(object):
         checksum = pack('!I', crc32(keyval) & 0xffffffff)
         blob = keyval_size + keyval + checksum
 
-        write(self._data_fd, blob)
-        # Update the in memory index.
-        self._index[key] = (self._current_offset + 8 + key_size,
-                            val_size)
-        self._current_offset += len(blob)
+        # Update the in memory index to point to the val.
+        self._index[key] = self._data_fd.tell() + 8 + key_size, val_size
+        # Write the blob
+        self._data_fd.write(blob)
 
     def __contains__(self, key):
         return key in self._index
 
-    def __delitem__(self, key, len=len, write=os.write, deleted=_DELETED,
+    def __delitem__(self, key, len=len, deleted=_DELETED,
                     str_type=compat.str_type, isinstance=isinstance,
                     crc32=crc32, pack=struct.pack):
         if isinstance(key, str_type):
@@ -148,9 +147,8 @@ class _SemiDBM(object):
         crc = pack('!I', crc32(key) & 0xffffffff)
         blob = key_size + key + crc
 
-        write(self._data_fd, blob)
+        self._data_fd.write(blob)
         del self._index[key]
-        self._current_offset += len(blob)
 
     def __iter__(self):
         for key in self._index:
@@ -181,7 +179,8 @@ class _SemiDBM(object):
         if compact:
             self.compact()
         self.sync()
-        os.close(self._data_fd)
+        self._data_fd.close()
+        self._data_fd = None
 
     def sync(self):
         """Sync the db to disk.
@@ -196,7 +195,7 @@ class _SemiDBM(object):
         """
         # The files are opened unbuffered so we don't technically
         # need to flush the file objects.
-        os.fsync(self._data_fd)
+        self._data_fd.flush()
 
     def compact(self):
         """Compact the db to reduce space.
@@ -223,7 +222,8 @@ class _SemiDBM(object):
             new_db[key] = self[key]
         new_db.sync()
         new_db.close()
-        os.close(self._data_fd)
+        self._data_fd.close()
+        self._data_fd = None
         self._renamer(new_db._data_filename, self._data_filename)
         os.rmdir(new_db._dbdir)
         # The index is already compacted so we don't need to compact it.
@@ -231,6 +231,8 @@ class _SemiDBM(object):
 
 
 class _SemiDBMReadOnly(_SemiDBM):
+    open_flags = compat.DATA_OPEN_FLAGS_READ
+
     def __delitem__(self, key):
         self._method_not_allowed('delitem')
 
@@ -247,7 +249,8 @@ class _SemiDBMReadOnly(_SemiDBM):
         raise DBMError("Can't %s: db opened in read only mode." % method_name)
 
     def close(self, compact=False):
-        os.close(self._data_fd)
+        self._data_fd.close()
+        self._data_fd = None
 
 
 class _SemiDBMReadWrite(_SemiDBM):
